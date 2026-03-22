@@ -28,6 +28,7 @@ function createFetchStub(pages: Record<string, string>, delaysMs?: Record<string
 let dbPath = "";
 let db: Database<sqlite3.Database, sqlite3.Statement>;
 const managers: CrawlerManager[] = [];
+const serial = { concurrency: false };
 
 function registerManager(manager: CrawlerManager) {
   managers.push(manager);
@@ -72,14 +73,14 @@ after(async () => {
   rmSync(dbPath, { force: true });
 });
 
-test("normalizeUrl handles base URLs and rejects non-http", async () => {
+test("normalizeUrl handles base URLs and rejects non-http", serial, async () => {
   const { normalizeUrl } = await import("../crawler/parser");
   const result = normalizeUrl("/path", "https://example.com/root");
   assert.equal(result, "https://example.com/path");
   assert.equal(normalizeUrl("mailto:test@example.com"), null);
 });
 
-test("frontier prevents duplicate URLs", async () => {
+test("frontier prevents duplicate URLs", serial, async () => {
   const { FrontierQueue } = await import("../crawler/frontier");
 
   await db.run(
@@ -100,7 +101,7 @@ test("frontier prevents duplicate URLs", async () => {
 
 });
 
-test("depth limit enforcement stops beyond max depth", async () => {
+test("depth limit enforcement stops beyond max depth", serial, async () => {
   const { CrawlerManager } = await import("../crawler/manager");
 
   const pages = {
@@ -127,7 +128,7 @@ test("depth limit enforcement stops beyond max depth", async () => {
 
 });
 
-test("search works while indexing is active", async () => {
+test("search works while indexing is active", serial, async () => {
   const { CrawlerManager } = await import("../crawler/manager");
   const { SearchService } = await import("../search/searchService");
 
@@ -149,9 +150,67 @@ test("search works while indexing is active", async () => {
   assert.ok(status && status.status === "running");
   assert.ok(results.length > 0);
 
+  const completionDeadline = Date.now() + 2000;
+  while (Date.now() < completionDeadline) {
+    const finalStatus = await manager.getJob(job.id);
+    if (finalStatus?.status === "completed") {
+      break;
+    }
+    await delay(50);
+  }
+
 });
 
-test("resume after interruption continues pending frontier", async () => {
+test("search returns all relevant URLs by default", serial, async () => {
+  const { SearchService } = await import("../search/searchService");
+
+  await db.run(
+    "INSERT INTO crawl_jobs (id, origin_url, max_depth, status, created_at, updated_at) VALUES (?, ?, ?, 'completed', ?, ?)",
+    "job-search-all",
+    "https://example.com",
+    1,
+    new Date().toISOString(),
+    new Date().toISOString()
+  );
+
+  await db.run("INSERT INTO terms (term) VALUES (?)", "alpha");
+  const termRow = await db.get<{ id: number }>("SELECT id FROM terms WHERE term = ?", "alpha");
+  assert.ok(termRow);
+
+  for (let index = 0; index < 60; index += 1) {
+    const url = `https://example.com/page-${index}`;
+    await db.run(
+      "INSERT INTO pages (url, title, fetched_at) VALUES (?, ?, ?)",
+      url,
+      `Page ${index}`,
+      new Date().toISOString()
+    );
+    const pageRow = await db.get<{ id: number }>("SELECT id FROM pages WHERE url = ?", url);
+    assert.ok(pageRow);
+    await db.run(
+      "INSERT INTO job_pages (job_id, page_id, origin_url, depth, discovered_at) VALUES (?, ?, ?, ?, ?)",
+      "job-search-all",
+      pageRow.id,
+      "https://example.com",
+      1,
+      new Date().toISOString()
+    );
+    await db.run(
+      "INSERT INTO page_terms (job_id, page_id, term_id, frequency) VALUES (?, ?, ?, ?)",
+      "job-search-all",
+      pageRow.id,
+      termRow.id,
+      1
+    );
+  }
+
+  const search = new SearchService(db);
+  const results = await search.search("alpha");
+
+  assert.equal(results.length, 60);
+});
+
+test("resume after interruption continues pending frontier", serial, async () => {
   const { CrawlerManager } = await import("../crawler/manager");
 
   await db.run(

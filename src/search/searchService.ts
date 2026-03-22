@@ -11,15 +11,14 @@ export type SearchResult = {
 export class SearchService {
   constructor(private readonly db: Database<sqlite3.Database, sqlite3.Statement>) {}
 
-  async search(query: string, limit = 50): Promise<SearchResult[]> {
+  async search(query: string, limit?: number): Promise<SearchResult[]> {
     const terms = Array.from(tokenize(query).keys());
     if (terms.length === 0) {
       return [];
     }
 
     const placeholders = terms.map(() => "?").join(",");
-    const rows = await this.db.all<any[]>(
-      `
+    const sql = `
       SELECT p.url as relevant_url,
              jp.origin_url as origin_url,
              jp.depth as depth,
@@ -31,11 +30,11 @@ export class SearchService {
       WHERE t.term IN (${placeholders})
       GROUP BY p.url, jp.origin_url, jp.depth
       ORDER BY score DESC
-      LIMIT ?
-      `,
-      ...terms,
-      limit
-    );
+    `;
+
+    const rows = limit === undefined
+      ? await this.db.all<any[]>(sql, ...terms)
+      : await this.db.all<any[]>(`${sql}\n      LIMIT ?`, ...terms, limit);
 
     return rows.map((row) => ({
       relevant_url: row.relevant_url,

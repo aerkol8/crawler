@@ -19,7 +19,7 @@ This project provides a local web crawler and search system with a minimal web U
 
 - Crawl with depth limit and global de-duplication.
 - Backpressure via max queue depth and max concurrent fetches.
-- Search while indexing is active.
+- Search while indexing is active and returns all matching URL/origin/depth triples.
 - Resume incomplete crawl jobs after restart, with automated verification for pending-frontier recovery.
 
 ## Configuration
