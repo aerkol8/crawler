@@ -101,6 +101,30 @@ test("frontier prevents duplicate URLs", serial, async () => {
 
 });
 
+test("frontier enforces max queue under concurrent enqueues", serial, async () => {
+  const { FrontierQueue } = await import("../crawler/frontier");
+
+  await db.run(
+    "INSERT INTO crawl_jobs (id, origin_url, max_depth, status, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?)",
+    "job-cap",
+    "https://example.com",
+    1,
+    new Date().toISOString(),
+    new Date().toISOString()
+  );
+
+  const frontier = new FrontierQueue("job-cap", db, 1);
+  await frontier.init();
+
+  const results = await Promise.all([
+    frontier.enqueue("https://example.com/a", 0),
+    frontier.enqueue("https://example.com/b", 0)
+  ]);
+
+  assert.equal(results.filter(Boolean).length, 1);
+  assert.equal(frontier.getQueueDepth(), 1);
+});
+
 test("depth limit enforcement stops beyond max depth", serial, async () => {
   const { CrawlerManager } = await import("../crawler/manager");
 

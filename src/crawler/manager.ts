@@ -28,7 +28,10 @@ export class CrawlerManager {
   private readonly pools = new Map<string, WorkerPool>();
   private readonly frontiers = new Map<string, FrontierQueue>();
 
-  constructor(private readonly db: Database<sqlite3.Database, sqlite3.Statement>) {}
+  constructor(
+    private readonly db: Database<sqlite3.Database, sqlite3.Statement>,
+    private readonly onJobUpdated?: (jobId: string) => void
+  ) {}
 
   async startJob(originUrl: string, maxDepth: number): Promise<CrawlJob> {
     const jobId = randomUUID();
@@ -325,5 +328,7 @@ export class CrawlerManager {
       new Date().toISOString(),
       jobId
     );
+
+    this.onJobUpdated?.(jobId);
   }
 }

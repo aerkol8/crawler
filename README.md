@@ -1,6 +1,6 @@
 # Web Crawler and Search (Local)
 
-This project provides a local web crawler and search system with a minimal web UI. It supports indexing a site from an origin URL to a maximum depth, and searching the indexed pages while crawling is active.
+This project provides a local web crawler and real-time search system for localhost use. It indexes from an origin URL to a maximum depth, supports searching while indexing is active, and exposes a live dashboard for crawl status, queue depth, and backpressure visibility.
 
 ## Quick Start
 
@@ -19,7 +19,11 @@ This project provides a local web crawler and search system with a minimal web U
 
 - Crawl with depth limit and global de-duplication.
 - Backpressure via max queue depth and max concurrent fetches.
+- Low-level HTML parsing and link extraction without full-featured crawler/search frameworks.
+- Explicit async-mutex coordination for worker/frontier state updates under concurrent activity.
 - Search while indexing is active and returns all matching URL/origin/depth triples.
+- Live dashboard updates over Server-Sent Events for job status, queue depth, processed count, and throttling state.
+- Live search updates over Server-Sent Events so results refresh as the index grows.
 - Resume incomplete crawl jobs after restart, with automated verification for pending-frontier recovery.
 
 ## Configuration

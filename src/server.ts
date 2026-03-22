@@ -1,13 +1,44 @@
 import express from "express";
+import type { Request, Response } from "express";
 import { config } from "./config";
 import { getDb } from "./db";
 import { CrawlerManager } from "./crawler/manager";
 import { SearchService } from "./search/searchService";
+import { UpdateBus } from "./live/updateBus";
 import { renderHome, renderSearch, renderStatus } from "./ui/templates";
+
+function initializeEventStream(res: Response) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+}
+
+function writeEvent(res: Response, eventName: string, payload: unknown) {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function attachHeartbeat(res: Response) {
+  return setInterval(() => {
+    res.write(": heartbeat\n\n");
+  }, 15000);
+}
+
+function createSerializedSender<T>(send: (payload?: T) => Promise<void>) {
+  let chain = Promise.resolve();
+  return (payload?: T) => {
+    chain = chain.then(() => send(payload)).catch(() => {
+      // Keep the connection open for later updates if a single send fails.
+    });
+  };
+}
 
 async function main() {
   const db = await getDb();
-  const manager = new CrawlerManager(db);
+  const updateBus = new UpdateBus();
+  const manager = new CrawlerManager(db, (jobId) => updateBus.publishJob(jobId));
   const searchService = new SearchService(db);
 
   await manager.resumeIncompleteJobs();
@@ -80,6 +111,72 @@ async function main() {
       return;
     }
     res.json(job);
+  });
+
+  app.get("/events/jobs", async (req: Request, res: Response) => {
+    initializeEventStream(res);
+    const heartbeat = attachHeartbeat(res);
+    const sendJobs = createSerializedSender(async () => {
+      const jobs = await manager.listJobs();
+      writeEvent(res, "jobs", jobs);
+    });
+
+    sendJobs();
+    const unsubscribe = updateBus.subscribe(() => {
+      sendJobs();
+    });
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    });
+  });
+
+  app.get("/events/job/:jobId", async (req: Request, res: Response) => {
+    initializeEventStream(res);
+    const { jobId } = req.params;
+    const heartbeat = attachHeartbeat(res);
+    const sendJob = createSerializedSender(async () => {
+      const job = await manager.getJob(jobId);
+      if (job) {
+        writeEvent(res, "job", job);
+      }
+    });
+
+    sendJob();
+    const unsubscribe = updateBus.subscribe((event) => {
+      if (event.jobId === jobId) {
+        sendJob();
+      }
+    });
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    });
+  });
+
+  app.get("/events/search", async (req: Request, res: Response) => {
+    const query = String(req.query.query ?? "").trim();
+    initializeEventStream(res);
+    const heartbeat = attachHeartbeat(res);
+    const sendResults = createSerializedSender(async () => {
+      const results = query ? await searchService.search(query) : [];
+      writeEvent(res, "results", results);
+    });
+
+    sendResults();
+    const unsubscribe = updateBus.subscribe(() => {
+      sendResults();
+    });
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    });
   });
 
   app.listen(config.port, () => {
