@@ -1,10 +1,12 @@
 export const config = {
-  port: Number.parseInt(process.env.PORT ?? "3000", 10),
+  port: Number.parseInt(process.env.PORT ?? "3600", 10),
   dbPath: process.env.DB_PATH ?? "./crawler.db",
   maxQueue: Number.parseInt(process.env.MAX_QUEUE ?? "2000", 10),
   maxConcurrent: Number.parseInt(process.env.MAX_CONCURRENT ?? "6", 10),
   ratePerSec: Number.parseFloat(process.env.RATE_PER_SEC ?? "2"),
   requestTimeoutMs: Number.parseInt(process.env.REQUEST_TIMEOUT_MS ?? "10000", 10),
   userAgent: process.env.USER_AGENT ?? "LocalCrawler/0.1",
-  maxBodyBytes: Number.parseInt(process.env.MAX_BODY_BYTES ?? "2000000", 10)
+  maxBodyBytes: Number.parseInt(process.env.MAX_BODY_BYTES ?? "2000000", 10),
+  rawStoragePath: process.env.RAW_STORAGE_PATH ?? "./data/storage/p.data",
+  rawStorageJobId: process.env.RAW_STORAGE_JOB_ID ?? ""
 };

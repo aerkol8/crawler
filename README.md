@@ -19,7 +19,7 @@ The implementation is intentionally biased toward simple, inspectable building b
 
 1. Install dependencies with `npm install`.
 2. Start the app with `npm run dev`.
-3. Open `http://localhost:3000`.
+3. Open `http://localhost:3600`.
 4. Create a crawl job, watch status update live, and run searches while indexing is still active.
 
 ## Commands
@@ -29,6 +29,7 @@ The implementation is intentionally biased toward simple, inspectable building b
 - npm run build
 - npm start
 - npm test
+- npm run export:storage
 
 ## Features
 
@@ -40,6 +41,8 @@ The implementation is intentionally biased toward simple, inspectable building b
 - Live dashboard updates over Server-Sent Events for job status, queue depth, processed count, and throttling state.
 - Live search updates over Server-Sent Events so results refresh as the index grows.
 - Resume incomplete crawl jobs after restart, with automated verification for pending-frontier recovery.
+- Compatibility raw storage export at `data/storage/p.data`.
+- Compatibility search route at `GET /search?query=<word>&sortBy=relevance` with `relevance_score`.
 
 ## Architecture
 
@@ -54,8 +57,17 @@ The implementation is intentionally biased toward simple, inspectable building b
 - `/` starts crawl jobs, shows recent jobs, and displays live queue/backpressure state.
 - `/status/:jobId` shows a live job dashboard with status, queued URLs, processed URLs, active workers, errors, and updated time.
 - `/search?query=...` shows live search results while indexing is active.
+- `/search?query=...&sortBy=relevance` returns question-compatible JSON from `data/storage/p.data`.
 - `/api/index`, `/api/status/:jobId`, and `/api/search` provide JSON endpoints.
 - `/events/jobs`, `/events/job/:jobId`, and `/events/search` provide SSE event streams.
+
+## Question Compatibility
+
+- The repository includes a raw storage snapshot at `data/storage/p.data`.
+- The compatibility search API returns JSON results with `relevant_url`, `origin_url`, `depth`, `matched_frequency`, and `relevance_score`.
+- The compatibility scoring formula is:
+  - `(frequency * 10) + 1000 - (depth * 5)` for exact single-word matches.
+- Regenerate the raw storage snapshot with `npm run export:storage`.
 
 ## Relevance Model
 
@@ -72,7 +84,9 @@ The implementation is intentionally biased toward simple, inspectable building b
 
 Environment variables:
 
-- PORT: HTTP port (default 3000)
+- PORT: HTTP port (default 3600)
+- RAW_STORAGE_PATH: raw storage export path for question-compatible search (default `./data/storage/p.data`)
+- RAW_STORAGE_JOB_ID: optional job ID to export into the raw storage snapshot
 - DB_PATH: SQLite database file (default ./crawler.db)
 - MAX_QUEUE: maximum queued URLs per job (default 2000)
 - MAX_CONCURRENT: maximum concurrent fetches (default 6)

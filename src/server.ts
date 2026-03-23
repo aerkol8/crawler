@@ -5,6 +5,7 @@ import { getDb } from "./db";
 import { CrawlerManager } from "./crawler/manager";
 import { SearchService } from "./search/searchService";
 import { UpdateBus } from "./live/updateBus";
+import { ensureRawStorageSnapshot, searchRawStorage } from "./storage/rawStorage";
 import { renderHome, renderSearch, renderStatus } from "./ui/templates";
 
 function initializeEventStream(res: Response) {
@@ -47,6 +48,7 @@ async function main() {
   const searchService = new SearchService(db);
 
   await manager.resumeIncompleteJobs();
+  await ensureRawStorageSnapshot(db, config.rawStoragePath, config.rawStorageJobId || undefined);
 
   const app = express();
   app.use(express.urlencoded({ extended: true }));
@@ -104,12 +106,38 @@ async function main() {
 
   app.get("/search", async (req, res) => {
     const query = String(req.query.query ?? "").trim();
+    const sortBy = String(req.query.sortBy ?? "").trim();
+
+    if (sortBy) {
+      if (sortBy !== "relevance") {
+        res.status(400).json({ error: "Unsupported sortBy" });
+        return;
+      }
+
+      const results = query ? await searchRawStorage(config.rawStoragePath, query) : [];
+      res.json(results);
+      return;
+    }
+
     const results = query ? await searchService.search(query) : [];
     res.send(renderSearch(query, results));
   });
 
   app.get("/api/search", async (req, res) => {
     const query = String(req.query.query ?? "").trim();
+    const sortBy = String(req.query.sortBy ?? "").trim();
+
+    if (sortBy) {
+      if (sortBy !== "relevance") {
+        res.status(400).json({ error: "Unsupported sortBy" });
+        return;
+      }
+
+      const results = query ? await searchRawStorage(config.rawStoragePath, query) : [];
+      res.json(results);
+      return;
+    }
+
     const results = query ? await searchService.search(query) : [];
     res.json(results);
   });
