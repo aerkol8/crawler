@@ -125,6 +125,19 @@ export class FrontierQueue {
     });
   }
 
+  async markStopped() {
+    await this.stateMutex.runExclusive(async () => {
+      const now = new Date().toISOString();
+      await this.db.run(
+        "UPDATE frontier SET status = 'failed', error = 'stopped', updated_at = ? WHERE job_id = ? AND status IN ('pending', 'processing')",
+        now,
+        this.jobId
+      );
+      this.inMemory.length = 0;
+      this.pendingCount = 0;
+    });
+  }
+
   private async fillFromDb() {
     const batch = await this.db.all<FrontierItem[]>(
       "SELECT id, url, depth FROM frontier WHERE job_id = ? AND status = 'pending' ORDER BY id LIMIT ?",

@@ -1,4 +1,7 @@
 node_modules
 /dist
 crawler.db
+*.db-shm
+*.db-wal
+test-*.db
 .env

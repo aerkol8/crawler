@@ -14,7 +14,28 @@ function renderBackpressureLabel(queuedCount: number, maxQueue: number) {
   return queuedCount >= maxQueue ? "active" : "ok";
 }
 
-function renderJobRow(job: JobStatus, maxQueue: number) {
+function canStopJob(status: string) {
+  return status === "running" || status === "stopping";
+}
+
+function renderJobActions(job: JobStatus, redirectTo: string) {
+  const stopLabel = job.status === "stopping" ? "Stopping..." : "Stop";
+  const stopDisabled = canStopJob(job.status) ? "" : "disabled";
+
+  return `
+      <div class="actions">
+        <form method="post" action="/jobs/${encodeURIComponent(job.id)}/stop">
+          <input type="hidden" name="redirectTo" value="${escapeHtml(redirectTo)}" />
+          <button type="submit" ${stopDisabled}>${stopLabel}</button>
+        </form>
+        <form method="post" action="/jobs/${encodeURIComponent(job.id)}/delete" onsubmit="return confirm('Delete this crawl job and indexed data?');">
+          <input type="hidden" name="redirectTo" value="${escapeHtml(redirectTo)}" />
+          <button type="submit" class="danger">Delete</button>
+        </form>
+      </div>`;
+}
+
+function renderJobRow(job: JobStatus, maxQueue: number, redirectTo: string) {
   return `
       <tr>
         <td>${escapeHtml(job.id)}</td>
@@ -26,6 +47,7 @@ function renderJobRow(job: JobStatus, maxQueue: number) {
         <td>${job.activeWorkers}</td>
         <td>${job.processedCount}</td>
         <td><a href="/status/${encodeURIComponent(job.id)}">view</a></td>
+        <td>${renderJobActions(job, redirectTo)}</td>
       </tr>`;
 }
 
@@ -39,8 +61,8 @@ function renderSearchRow(row: SearchResult) {
 }
 
 export function renderHome(jobs: JobStatus[], maxQueue: number) {
-  const jobRows = jobs.map((job) => renderJobRow(job, maxQueue)).join("");
-  const emptyRow = "<tr><td colspan='9'>No jobs yet</td></tr>";
+  const jobRows = jobs.map((job) => renderJobRow(job, maxQueue, "/")).join("");
+  const emptyRow = "<tr><td colspan='10'>No jobs yet</td></tr>";
 
   return `
   <html>
@@ -52,6 +74,9 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
         table { border-collapse: collapse; width: 100%; }
         th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
         th { background: #f5f0e6; }
+        .actions { display: flex; gap: 8px; }
+        .actions form { margin: 0; }
+        .danger { color: #7a1f1f; }
       </style>
     </head>
     <body>
@@ -73,6 +98,7 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
       </form>
 
       <h2>Recent Jobs</h2>
+      <p>Crawl jobs stay in the local database until you delete them.</p>
       <p>Live event stream connected. Last refresh: <span id="job-refresh-time">server render</span></p>
       <table>
         <thead>
@@ -86,6 +112,7 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
             <th>Active</th>
             <th>Processed</th>
             <th>Detail</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody id="job-rows">
@@ -95,6 +122,7 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
       <script>
         const maxQueue = ${JSON.stringify(maxQueue)};
         const emptyRow = ${JSON.stringify(emptyRow)};
+        const redirectTo = "/";
 
         function escapeHtml(value) {
           return String(value)
@@ -103,6 +131,28 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
             .replace(/>/g, "&gt;")
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#39;");
+        }
+
+        function canStopJob(status) {
+          return status === "running" || status === "stopping";
+        }
+
+        function renderActions(job) {
+          const stopLabel = job.status === "stopping" ? "Stopping..." : "Stop";
+          const stopDisabled = canStopJob(job.status) ? "" : "disabled";
+
+          return \`
+            <div class="actions">
+              <form method="post" action="/jobs/\${encodeURIComponent(job.id)}/stop">
+                <input type="hidden" name="redirectTo" value="\${escapeHtml(redirectTo)}" />
+                <button type="submit" \${stopDisabled}>\${stopLabel}</button>
+              </form>
+              <form method="post" action="/jobs/\${encodeURIComponent(job.id)}/delete" onsubmit="return confirm('Delete this crawl job and indexed data?');">
+                <input type="hidden" name="redirectTo" value="\${escapeHtml(redirectTo)}" />
+                <button type="submit" class="danger">Delete</button>
+              </form>
+            </div>
+          \`;
         }
 
         function renderRows(jobs) {
@@ -121,6 +171,7 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
               <td>\${job.activeWorkers}</td>
               <td>\${job.processedCount}</td>
               <td><a href="/status/\${encodeURIComponent(job.id)}">view</a></td>
+              <td>\${renderActions(job)}</td>
             </tr>
           \`).join("");
         }
@@ -145,6 +196,8 @@ export function renderHome(jobs: JobStatus[], maxQueue: number) {
 
 export function renderStatus(job: JobStatus, maxQueue: number) {
   const jobId = escapeHtml(job.id);
+  const stopLabel = job.status === "stopping" ? "Stopping..." : "Stop";
+  const stopDisabled = canStopJob(job.status) ? "" : "disabled";
   return `
   <html>
     <head>
@@ -152,11 +205,25 @@ export function renderStatus(job: JobStatus, maxQueue: number) {
       <style>
         body { font-family: Georgia, serif; margin: 32px; }
         .card { border: 1px solid #ccc; padding: 16px; width: 520px; }
+        .actions { display: flex; gap: 8px; margin: 0 0 16px; }
+        .actions form { margin: 0; }
+        .danger { color: #7a1f1f; }
       </style>
     </head>
     <body>
       <h1>Job Status</h1>
       <p>Live dashboard updates through a server event stream.</p>
+      <p>Use Stop to halt new work for this crawl, or Delete to remove it from the local index.</p>
+      <div class="actions">
+        <form method="post" action="/jobs/${encodeURIComponent(job.id)}/stop">
+          <input type="hidden" name="redirectTo" value="/status/${encodeURIComponent(job.id)}" />
+          <button id="stop-button" type="submit" ${stopDisabled}>${stopLabel}</button>
+        </form>
+        <form method="post" action="/jobs/${encodeURIComponent(job.id)}/delete" onsubmit="return confirm('Delete this crawl job and indexed data?');">
+          <input type="hidden" name="redirectTo" value="/" />
+          <button type="submit" class="danger">Delete</button>
+        </form>
+      </div>
       <div class="card">
         <p><strong>Job ID:</strong> <span id="job-id">${jobId}</span></p>
         <p><strong>Origin:</strong> <span id="job-origin">${escapeHtml(job.originUrl)}</span></p>
@@ -175,6 +242,10 @@ export function renderStatus(job: JobStatus, maxQueue: number) {
         const jobId = ${JSON.stringify(job.id)};
         const maxQueue = ${JSON.stringify(maxQueue)};
 
+        function canStopJob(status) {
+          return status === "running" || status === "stopping";
+        }
+
         function applyJob(job) {
             document.getElementById("job-id").textContent = job.id;
             document.getElementById("job-origin").textContent = job.originUrl;
@@ -187,6 +258,9 @@ export function renderStatus(job: JobStatus, maxQueue: number) {
             document.getElementById("job-errors").textContent = String(job.errorCount);
             document.getElementById("job-updated").textContent = job.updatedAt;
             document.getElementById("job-refresh-time").textContent = new Date().toLocaleTimeString();
+            const stopButton = document.getElementById("stop-button");
+            stopButton.disabled = !canStopJob(job.status);
+            stopButton.textContent = job.status === "stopping" ? "Stopping..." : "Stop";
         }
 
         function connectStatusStream() {

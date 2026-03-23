@@ -26,6 +26,11 @@ function attachHeartbeat(res: Response) {
   }, 15000);
 }
 
+function resolveRedirectPath(req: Request, fallback: string) {
+  const candidate = String(req.body?.redirectTo || req.get("referer") || fallback);
+  return candidate.startsWith("/") ? candidate : fallback;
+}
+
 function createSerializedSender<T>(send: (payload?: T) => Promise<void>) {
   let chain = Promise.resolve();
   return (payload?: T) => {
@@ -63,6 +68,24 @@ async function main() {
 
     const job = await manager.startJob(origin, maxDepth);
     res.redirect(`/status/${job.id}`);
+  });
+
+  app.post("/jobs/:jobId/stop", async (req, res) => {
+    const job = await manager.stopJob(req.params.jobId);
+    if (!job) {
+      res.status(404).send("Not found");
+      return;
+    }
+    res.redirect(resolveRedirectPath(req, `/status/${job.id}`));
+  });
+
+  app.post("/jobs/:jobId/delete", async (req, res) => {
+    const deleted = await manager.deleteJob(req.params.jobId);
+    if (!deleted) {
+      res.status(404).send("Not found");
+      return;
+    }
+    res.redirect(resolveRedirectPath(req, "/"));
   });
 
   app.get("/status", async (_req, res) => {
@@ -111,6 +134,24 @@ async function main() {
       return;
     }
     res.json(job);
+  });
+
+  app.post("/api/jobs/:jobId/stop", async (req, res) => {
+    const job = await manager.stopJob(req.params.jobId);
+    if (!job) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json(job);
+  });
+
+  app.post("/api/jobs/:jobId/delete", async (req, res) => {
+    const deleted = await manager.deleteJob(req.params.jobId);
+    if (!deleted) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json({ ok: true });
   });
 
   app.get("/events/jobs", async (req: Request, res: Response) => {

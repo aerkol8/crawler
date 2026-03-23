@@ -20,6 +20,8 @@ test("renderHome includes live dashboard polling", () => {
 
   assert.match(html, /new EventSource\("\/events\/jobs"\)/);
   assert.match(html, /Live event stream connected/);
+  assert.match(html, /\/jobs\/job-1\/stop/);
+  assert.match(html, /Delete/);
 });
 
 test("renderStatus includes live job polling", () => {
@@ -27,6 +29,14 @@ test("renderStatus includes live job polling", () => {
 
   assert.match(html, /new EventSource\("\/events\/job\/"/);
   assert.match(html, /Live dashboard updates through a server event stream/);
+  assert.match(html, /id="stop-button"/);
+  assert.match(html, /\/jobs\/job-1\/delete/);
+});
+
+test("renderStatus disables stop button for completed jobs", () => {
+  const html = renderStatus({ ...sampleJob, status: "completed", activeWorkers: 0 }, 10);
+
+  assert.match(html, /id="stop-button" type="submit" disabled/);
 });
 
 test("renderSearch includes live polling when a query is present", () => {

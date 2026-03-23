@@ -27,6 +27,8 @@ export type JobStatus = {
 export class CrawlerManager {
   private readonly pools = new Map<string, WorkerPool>();
   private readonly frontiers = new Map<string, FrontierQueue>();
+  private readonly stoppingJobs = new Set<string>();
+  private readonly fetchControllers = new Map<string, Set<AbortController>>();
 
   constructor(
     private readonly db: Database<sqlite3.Database, sqlite3.Statement>,
@@ -60,6 +62,22 @@ export class CrawlerManager {
     await this.db.run(
       "UPDATE frontier SET status = 'pending' WHERE status = 'processing'"
     );
+
+    const stoppingJobs = await this.db.all<{ id: string }[]>(
+      "SELECT id FROM crawl_jobs WHERE status = 'stopping'"
+    );
+
+    for (const job of stoppingJobs) {
+      const frontier = new FrontierQueue(job.id, this.db, config.maxQueue);
+      await frontier.init();
+      await frontier.markStopped();
+      await this.db.run(
+        "UPDATE crawl_jobs SET status = 'stopped', queued_count = 0, active_workers = 0, updated_at = ? WHERE id = ?",
+        new Date().toISOString(),
+        job.id
+      );
+      this.onJobUpdated?.(job.id);
+    }
 
     const jobs = await this.db.all<{ id: string; origin_url: string; max_depth: number }[]>(
       "SELECT id, origin_url, max_depth FROM crawl_jobs WHERE status = 'running'"
@@ -114,12 +132,64 @@ export class CrawlerManager {
     };
   }
 
+  async stopJob(jobId: string): Promise<JobStatus | null> {
+    const job = await this.getJob(jobId);
+    if (!job) {
+      return null;
+    }
+
+    if (job.status === "completed" || job.status === "stopped") {
+      return job;
+    }
+
+    await this.requestStop(jobId);
+    await this.waitForJobToSettle(jobId);
+    await this.finalizeStop(jobId);
+    return this.getJob(jobId);
+  }
+
+  async deleteJob(jobId: string): Promise<boolean> {
+    const job = await this.getJob(jobId);
+    if (!job) {
+      return false;
+    }
+
+    if (job.status !== "completed" && job.status !== "stopped") {
+      await this.requestStop(jobId);
+      await this.waitForJobToSettle(jobId);
+      await this.finalizeStop(jobId);
+    } else {
+      this.cleanupJobRuntime(jobId);
+    }
+
+    await this.db.exec("BEGIN TRANSACTION;");
+    try {
+      await this.db.run("DELETE FROM page_terms WHERE job_id = ?", jobId);
+      await this.db.run("DELETE FROM job_pages WHERE job_id = ?", jobId);
+      await this.db.run("DELETE FROM frontier WHERE job_id = ?", jobId);
+      await this.db.run("DELETE FROM crawl_jobs WHERE id = ?", jobId);
+      await this.db.run("DELETE FROM pages WHERE id NOT IN (SELECT DISTINCT page_id FROM job_pages)");
+      await this.db.run("DELETE FROM terms WHERE id NOT IN (SELECT DISTINCT term_id FROM page_terms)");
+      await this.db.exec("COMMIT;");
+    } catch (error) {
+      await this.db.exec("ROLLBACK;");
+      throw error;
+    }
+
+    this.cleanupJobRuntime(jobId);
+    this.onJobUpdated?.(jobId);
+    return true;
+  }
+
   stopAll() {
     for (const pool of this.pools.values()) {
       pool.stop();
     }
     this.pools.clear();
     this.frontiers.clear();
+    this.stoppingJobs.clear();
+    this.abortAllFetches();
+    this.fetchControllers.clear();
   }
 
   private startPool(jobId: string, frontier: FrontierQueue, originUrl: string, maxDepth: number) {
@@ -150,6 +220,11 @@ export class CrawlerManager {
     item: FrontierItem
   ) {
     try {
+      if (this.isStopRequested(jobId)) {
+        await frontier.markFailed(item.id, "stopped");
+        return;
+      }
+
       if (item.depth > maxDepth) {
         await frontier.markDone(item.id);
         return;
@@ -167,8 +242,12 @@ export class CrawlerManager {
         return;
       }
 
-      const fetched = await this.fetchPage(item.url);
+      const fetched = await this.fetchPage(jobId, item.url);
       if (!fetched) {
+        if (this.isStopRequested(jobId)) {
+          await frontier.markFailed(item.id, "stopped");
+          return;
+        }
         await frontier.markFailed(item.id, "fetch_failed");
         await this.incrementError(jobId);
         return;
@@ -180,7 +259,7 @@ export class CrawlerManager {
       await this.insertJobPage(jobId, pageId, originUrl, item.depth);
       await this.indexTerms(jobId, pageId, parsed.termCounts);
 
-      if (item.depth < maxDepth) {
+      if (!this.isStopRequested(jobId) && item.depth < maxDepth) {
         for (const link of parsed.links) {
           const normalized = normalizeUrl(link);
           if (!normalized) {
@@ -196,6 +275,10 @@ export class CrawlerManager {
       await frontier.markDone(item.id);
       await this.incrementProcessed(jobId);
     } catch (error) {
+      if (this.isStopRequested(jobId)) {
+        await frontier.markFailed(item.id, "stopped");
+        return;
+      }
       await frontier.markFailed(item.id, "exception");
       await this.incrementError(jobId);
     } finally {
@@ -203,9 +286,10 @@ export class CrawlerManager {
     }
   }
 
-  private async fetchPage(url: string) {
+  private async fetchPage(jobId: string, url: string) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+    this.registerFetchController(jobId, controller);
 
     try {
       const response = await fetch(url, {
@@ -229,6 +313,7 @@ export class CrawlerManager {
       return null;
     } finally {
       clearTimeout(timeout);
+      this.unregisterFetchController(jobId, controller);
     }
   }
 
@@ -316,9 +401,24 @@ export class CrawlerManager {
   }
 
   private async updateJobStats(jobId: string, frontier: FrontierQueue, pool?: WorkerPool | null) {
+    const existing = await this.db.get<{ status: string }>(
+      "SELECT status FROM crawl_jobs WHERE id = ?",
+      jobId
+    );
+    if (!existing) {
+      this.cleanupJobRuntime(jobId);
+      return;
+    }
+
     const queuedCount = frontier.getQueueDepth();
     const activeWorkers = pool ? pool.getActiveCount() : 0;
-    const status = queuedCount === 0 && activeWorkers === 0 ? "completed" : "running";
+    let status = queuedCount === 0 && activeWorkers === 0 ? "completed" : "running";
+
+    if (existing.status === "stopping" || this.stoppingJobs.has(jobId)) {
+      status = activeWorkers === 0 ? "stopped" : "stopping";
+    } else if (existing.status === "stopped") {
+      status = "stopped";
+    }
 
     await this.db.run(
       "UPDATE crawl_jobs SET queued_count = ?, active_workers = ?, status = ?, updated_at = ? WHERE id = ?",
@@ -329,6 +429,126 @@ export class CrawlerManager {
       jobId
     );
 
+    if (status === "completed") {
+      this.cleanupJobRuntime(jobId);
+    }
+
     this.onJobUpdated?.(jobId);
+  }
+
+  private isStopRequested(jobId: string) {
+    return this.stoppingJobs.has(jobId);
+  }
+
+  private async requestStop(jobId: string) {
+    this.stoppingJobs.add(jobId);
+    this.pools.get(jobId)?.stop();
+    this.abortFetchesForJob(jobId);
+
+    const frontier = this.frontiers.get(jobId);
+    const pool = this.pools.get(jobId);
+    const queuedCount = frontier ? frontier.getQueueDepth() : 0;
+    const activeWorkers = pool ? pool.getActiveCount() : 0;
+
+    await this.db.run(
+      "UPDATE crawl_jobs SET status = 'stopping', queued_count = ?, active_workers = ?, updated_at = ? WHERE id = ?",
+      queuedCount,
+      activeWorkers,
+      new Date().toISOString(),
+      jobId
+    );
+
+    this.onJobUpdated?.(jobId);
+  }
+
+  private async waitForJobToSettle(jobId: string) {
+    const deadline = Date.now() + Math.max(config.requestTimeoutMs, 1000) + 1000;
+
+    while (Date.now() < deadline) {
+      const pool = this.pools.get(jobId);
+      if (!pool || pool.getActiveCount() === 0) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  private async finalizeStop(jobId: string) {
+    const job = await this.getJob(jobId);
+    if (!job) {
+      this.cleanupJobRuntime(jobId);
+      return;
+    }
+
+    const pool = this.pools.get(jobId);
+    const frontier = this.frontiers.get(jobId);
+    const activeWorkers = pool ? pool.getActiveCount() : 0;
+    if (frontier && activeWorkers === 0) {
+      await frontier.markStopped();
+    }
+    const queuedCount = frontier ? frontier.getQueueDepth() : job.queuedCount;
+    const status = activeWorkers === 0 ? "stopped" : "stopping";
+
+    await this.db.run(
+      "UPDATE crawl_jobs SET status = ?, queued_count = ?, active_workers = ?, updated_at = ? WHERE id = ?",
+      status,
+      queuedCount,
+      activeWorkers,
+      new Date().toISOString(),
+      jobId
+    );
+
+    if (status === "stopped") {
+      this.cleanupJobRuntime(jobId);
+    }
+
+    this.onJobUpdated?.(jobId);
+  }
+
+  private cleanupJobRuntime(jobId: string) {
+    this.pools.get(jobId)?.stop();
+    this.pools.delete(jobId);
+    this.frontiers.delete(jobId);
+    this.abortFetchesForJob(jobId);
+    this.fetchControllers.delete(jobId);
+    this.stoppingJobs.delete(jobId);
+  }
+
+  private registerFetchController(jobId: string, controller: AbortController) {
+    let controllers = this.fetchControllers.get(jobId);
+    if (!controllers) {
+      controllers = new Set<AbortController>();
+      this.fetchControllers.set(jobId, controllers);
+    }
+    controllers.add(controller);
+  }
+
+  private unregisterFetchController(jobId: string, controller: AbortController) {
+    const controllers = this.fetchControllers.get(jobId);
+    if (!controllers) {
+      return;
+    }
+
+    controllers.delete(controller);
+    if (controllers.size === 0) {
+      this.fetchControllers.delete(jobId);
+    }
+  }
+
+  private abortFetchesForJob(jobId: string) {
+    const controllers = this.fetchControllers.get(jobId);
+    if (!controllers) {
+      return;
+    }
+
+    for (const controller of controllers) {
+      controller.abort();
+    }
+  }
+
+  private abortAllFetches() {
+    for (const jobId of this.fetchControllers.keys()) {
+      this.abortFetchesForJob(jobId);
+    }
   }
 }
