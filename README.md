@@ -4,6 +4,17 @@ This project is a localhost web crawler and real-time search engine built for th
 
 The implementation is intentionally biased toward simple, inspectable building blocks instead of full crawler frameworks. Crawling uses native `fetch`, HTML parsing uses low-level string/regex extraction, frontier coordination is backed by SQLite plus explicit async mutexes, and live UI updates are delivered through Server-Sent Events.
 
+## Submission Summary
+
+- Localhost runnable with a local SQLite database.
+- Includes `index`, `search`, live system visibility, and backpressure controls.
+- Supports searching while indexing is active.
+- Includes interruption recovery as a bonus capability.
+- Submission artifacts are included in this repository:
+  - `README.md`
+  - `product_prd.md`
+  - `recommendation.md`
+
 ## Quick Start
 
 1. Install dependencies with `npm install`.
