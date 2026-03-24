@@ -44,10 +44,13 @@ test("renderSearch includes live polling when a query is present", () => {
     {
       relevant_url: "https://example.com/result",
       origin_url: "https://example.com",
-      depth: 1
+      depth: 1,
+      relevance_score: 1005
     }
   ]);
 
   assert.match(html, /new EventSource\("\/events\/search\?query="/);
   assert.match(html, /Live search updates through a server event stream/);
+  assert.match(html, /Relevance Score/);
+  assert.match(html, /1005/);
 });

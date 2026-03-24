@@ -57,6 +57,7 @@ function renderSearchRow(row: SearchResult) {
         <td>${escapeHtml(row.relevant_url)}</td>
         <td>${escapeHtml(row.origin_url)}</td>
         <td>${row.depth}</td>
+        <td>${row.relevance_score}</td>
       </tr>`;
 }
 
@@ -281,7 +282,7 @@ export function renderStatus(job: JobStatus, maxQueue: number) {
 
 export function renderSearch(query: string, results: SearchResult[]) {
   const resultRows = results.map((row) => renderSearchRow(row)).join("");
-  const emptyRow = "<tr><td colspan='3'>No results</td></tr>";
+  const emptyRow = "<tr><td colspan='4'>No results</td></tr>";
 
   return `
   <html>
@@ -309,6 +310,7 @@ export function renderSearch(query: string, results: SearchResult[]) {
             <th>Relevant URL</th>
             <th>Origin URL</th>
             <th>Depth</th>
+            <th>Relevance Score</th>
           </tr>
         </thead>
         <tbody id="search-results">
@@ -339,6 +341,7 @@ export function renderSearch(query: string, results: SearchResult[]) {
               <td>\${escapeHtml(row.relevant_url)}</td>
               <td>\${escapeHtml(row.origin_url)}</td>
               <td>\${row.depth}</td>
+              <td>\${row.relevance_score}</td>
             </tr>
           \`).join("");
         }

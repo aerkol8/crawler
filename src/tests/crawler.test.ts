@@ -508,7 +508,8 @@ test("deleteJob removes selected crawl data and keeps shared indexed pages", ser
     {
       relevant_url: "https://shared.example/page",
       origin_url: "https://example.org",
-      depth: 1
+      depth: 1,
+      relevance_score: 1025
     }
   ]);
 });

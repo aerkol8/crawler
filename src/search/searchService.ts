@@ -5,6 +5,7 @@ export type SearchResult = {
   relevant_url: string;
   origin_url: string;
   depth: number;
+  relevance_score: number;
 };
 
 export class SearchService {
@@ -17,7 +18,8 @@ export class SearchService {
     return limited.map((result) => ({
       relevant_url: result.relevant_url,
       origin_url: result.origin_url,
-      depth: result.depth
+      depth: result.depth,
+      relevance_score: result.relevance_score
     }));
   }
 }
