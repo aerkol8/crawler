@@ -1,6 +1,8 @@
 import { test, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Database } from "sqlite";
 import type sqlite3 from "sqlite3";
@@ -49,6 +51,7 @@ function createFetchStub(pages: Record<string, string>, delaysMs?: Record<string
 }
 
 let dbPath = "";
+let storagePath = "";
 let db: Database<sqlite3.Database, sqlite3.Statement>;
 const managers: CrawlerManager[] = [];
 const serial = { concurrency: false };
@@ -69,7 +72,9 @@ async function resetDb() {
 
 before(async () => {
   dbPath = `./test-${Date.now()}.db`;
+  storagePath = mkdtempSync(join(tmpdir(), "crawler-storage-test-"));
   process.env.DB_PATH = dbPath;
+  process.env.RAW_STORAGE_PATH = storagePath;
   process.env.MAX_QUEUE = "10";
   process.env.MAX_CONCURRENT = "2";
   process.env.RATE_PER_SEC = "100";
@@ -82,6 +87,7 @@ before(async () => {
 
 beforeEach(async () => {
   await resetDb();
+  rmSync(storagePath, { recursive: true, force: true });
 });
 
 afterEach(() => {
@@ -94,6 +100,7 @@ afterEach(() => {
 after(async () => {
   await db.close();
   rmSync(dbPath, { force: true });
+  rmSync(storagePath, { recursive: true, force: true });
 });
 
 test("normalizeUrl handles base URLs and rejects non-http", serial, async () => {
@@ -187,7 +194,7 @@ test("search works while indexing is active", serial, async () => {
 
   const manager = new CrawlerManager(db);
   registerManager(manager);
-  const search = new SearchService(db);
+  const search = new SearchService(storagePath);
   const job = await manager.startJob("https://example.com", 1);
 
   await delay(150);
@@ -206,6 +213,60 @@ test("search works while indexing is active", serial, async () => {
     await delay(50);
   }
 
+});
+
+test("reused fetched pages are searchable for later jobs", serial, async () => {
+  const { CrawlerManager } = await import("../crawler/manager");
+  const { SearchService } = await import("../search/searchService");
+
+  const pages = {
+    "https://example.com/root": "<html><body>root <a href='https://example.com/a'>A</a></body></html>",
+    "https://example.com/a": "<html><body>alpha only</body></html>"
+  };
+  globalThis.fetch = createFetchStub(pages) as any;
+
+  const manager = new CrawlerManager(db);
+  registerManager(manager);
+  const search = new SearchService(storagePath);
+
+  const firstJob = await manager.startJob("https://example.com/a", 0);
+
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const firstStatus = await manager.getJob(firstJob.id);
+    if (firstStatus?.status === "completed") {
+      break;
+    }
+    await delay(50);
+  }
+
+  const secondJob = await manager.startJob("https://example.com/root", 1);
+
+  const secondDeadline = Date.now() + 3000;
+  while (Date.now() < secondDeadline) {
+    const secondStatus = await manager.getJob(secondJob.id);
+    if (secondStatus?.status === "completed") {
+      break;
+    }
+    await delay(50);
+  }
+
+  const results = await search.search("alpha");
+
+  assert.ok(
+    results.some((result) => (
+      result.relevant_url === "https://example.com/a"
+      && result.origin_url === "https://example.com/a"
+      && result.depth === 0
+    ))
+  );
+  assert.ok(
+    results.some((result) => (
+      result.relevant_url === "https://example.com/a"
+      && result.origin_url === "https://example.com/root"
+      && result.depth === 1
+    ))
+  );
 });
 
 test("stopJob halts an active crawl and marks it stopped", serial, async () => {
@@ -285,6 +346,7 @@ test("stopJob leaves completed jobs unchanged", serial, async () => {
 
 test("search returns all relevant URLs by default", serial, async () => {
   const { SearchService } = await import("../search/searchService");
+  const { exportRawStorageSnapshot } = await import("../storage/rawStorage");
 
   await db.run(
     "INSERT INTO crawl_jobs (id, origin_url, max_depth, status, created_at, updated_at) VALUES (?, ?, ?, 'completed', ?, ?)",
@@ -326,7 +388,9 @@ test("search returns all relevant URLs by default", serial, async () => {
     );
   }
 
-  const search = new SearchService(db);
+  await exportRawStorageSnapshot(db, storagePath);
+
+  const search = new SearchService(storagePath);
   const results = await search.search("alpha");
 
   assert.equal(results.length, 60);
@@ -433,7 +497,7 @@ test("deleteJob removes selected crawl data and keeps shared indexed pages", ser
     "SELECT job_id, page_id FROM job_pages ORDER BY job_id, page_id"
   );
   const remainingTerms = await db.all<{ term: string }[]>("SELECT term FROM terms");
-  const search = new SearchService(db);
+  const search = new SearchService(storagePath);
   const results = await search.search("alpha");
 
   assert.deepEqual(remainingJobs.map((row) => row.id), ["job-delete-b"]);

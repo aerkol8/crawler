@@ -7,12 +7,15 @@ import { computeRelevanceScore, searchRawStorage } from "../storage/rawStorage";
 
 const tempDirs: string[] = [];
 
-function createRawStorageFile(contents: string) {
+function createRawStorageDir(files: Record<string, string>) {
   const dir = mkdtempSync(join(tmpdir(), "raw-storage-test-"));
   tempDirs.push(dir);
-  const storagePath = join(dir, "p.data");
-  writeFileSync(storagePath, contents, "utf8");
-  return storagePath;
+
+  for (const [fileName, contents] of Object.entries(files)) {
+    writeFileSync(join(dir, fileName), contents, "utf8");
+  }
+
+  return dir;
 }
 
 afterEach(() => {
@@ -30,13 +33,15 @@ test("computeRelevanceScore follows the compatibility formula", () => {
 });
 
 test("searchRawStorage sorts results by relevance_score for a single word query", async () => {
-  const storagePath = createRawStorageFile([
-    "python https://example.com/a https://origin.example 1 2",
-    "python https://example.com/b https://origin.example 0 1",
-    "python https://example.com/c https://origin.example 2 10"
-  ].join("\n"));
+  const storageDir = createRawStorageDir({
+    "p.data": [
+      "python https://example.com/a https://origin.example 1 2",
+      "python https://example.com/b https://origin.example 0 1",
+      "python https://example.com/c https://origin.example 2 10"
+    ].join("\n")
+  });
 
-  const results = await searchRawStorage(storagePath, "python");
+  const results = await searchRawStorage(storageDir, "python");
 
   assert.deepEqual(results, [
     {
@@ -63,14 +68,17 @@ test("searchRawStorage sorts results by relevance_score for a single word query"
   ]);
 });
 
-test("searchRawStorage aggregates matching terms for multi-word queries", async () => {
-  const storagePath = createRawStorageFile([
-    "python https://example.com/a https://origin.example 1 2",
-    "program https://example.com/a https://origin.example 1 3",
-    "python https://example.com/b https://origin.example 0 5"
-  ].join("\n"));
+test("searchRawStorage reads only the needed initial-letter bucket files", async () => {
+  const storageDir = createRawStorageDir({
+    "a.data": "alpha https://example.com/a https://origin.example 1 3",
+    "p.data": [
+      "python https://example.com/a https://origin.example 1 2",
+      "python https://example.com/b https://origin.example 0 5"
+    ].join("\n"),
+    "z.data": "zebra https://example.com/z https://origin.example 0 9"
+  });
 
-  const results = await searchRawStorage(storagePath, "python program");
+  const results = await searchRawStorage(join(storageDir, "p.data"), "python alpha");
 
   assert.deepEqual(results, [
     {

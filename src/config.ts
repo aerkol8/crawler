@@ -7,6 +7,6 @@ export const config = {
   requestTimeoutMs: Number.parseInt(process.env.REQUEST_TIMEOUT_MS ?? "10000", 10),
   userAgent: process.env.USER_AGENT ?? "LocalCrawler/0.1",
   maxBodyBytes: Number.parseInt(process.env.MAX_BODY_BYTES ?? "2000000", 10),
-  rawStoragePath: process.env.RAW_STORAGE_PATH ?? "./data/storage/p.data",
+  rawStoragePath: process.env.RAW_STORAGE_PATH ?? "./data/storage",
   rawStorageJobId: process.env.RAW_STORAGE_JOB_ID ?? ""
 };

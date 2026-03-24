@@ -8,12 +8,13 @@ async function main() {
   const outputPath = process.argv[3] || config.rawStoragePath;
   const result = await exportRawStorageSnapshot(db, outputPath, preferredJobId);
 
-  if (!result.jobId) {
-    console.log(`No indexed crawl data found. Wrote empty snapshot to ${outputPath}`);
+  if (result.lineCount === 0) {
+    console.log(`No indexed crawl data found. Cleared bucket files under ${result.storageDir}`);
     return;
   }
 
-  console.log(`Exported ${result.lineCount} rows from job ${result.jobId} to ${outputPath}`);
+  const scope = result.jobId ? `job ${result.jobId}` : `${result.jobCount} job(s)`;
+  console.log(`Exported ${result.lineCount} rows across ${result.bucketCount} bucket file(s) for ${scope} into ${result.storageDir}`);
 }
 
 void main();

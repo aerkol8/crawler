@@ -1,8 +1,9 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { Database } from "sqlite";
 import sqlite3 from "sqlite3";
 import { tokenize } from "../crawler/parser";
+import { AsyncMutex } from "../utils/asyncMutex";
 
 export type RawStorageEntry = {
   word: string;
@@ -20,9 +21,8 @@ export type RawStorageSearchResult = {
   relevance_score: number;
 };
 
-let cachedPath = "";
-let cachedMtimeMs = -1;
-let cachedEntries: RawStorageEntry[] = [];
+const bucketFilePattern = /^[a-z0-9]\.data$/;
+const rawStorageMutex = new AsyncMutex();
 
 function parseRawStorageLine(line: string): RawStorageEntry | null {
   const trimmed = line.trim();
@@ -52,23 +52,90 @@ function parseRawStorageLine(line: string): RawStorageEntry | null {
   };
 }
 
-async function loadRawStorageEntries(storagePath: string) {
-  const fileStats = await stat(storagePath);
-  if (cachedPath === storagePath && cachedMtimeMs === fileStats.mtimeMs) {
-    return cachedEntries;
+function resolveBucketKey(word: string) {
+  const initial = word.trim().charAt(0).toLowerCase();
+  return /^[a-z0-9]$/.test(initial) ? initial : null;
+}
+
+function resolveStorageDirectory(storagePath: string) {
+  return storagePath.endsWith(".data") ? dirname(storagePath) : storagePath;
+}
+
+function resolveBucketPath(storagePath: string, bucketKey: string) {
+  return join(resolveStorageDirectory(storagePath), `${bucketKey}.data`);
+}
+
+async function readBucketEntries(bucketPath: string) {
+  try {
+    const contents = await readFile(bucketPath, "utf8");
+    return contents
+      .split(/\r?\n/)
+      .map((line) => parseRawStorageLine(line))
+      .filter((entry): entry is RawStorageEntry => entry !== null);
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
   }
+}
 
-  const contents = await readFile(storagePath, "utf8");
-  const entries = contents
-    .split(/\r?\n/)
-    .map((line) => parseRawStorageLine(line))
-    .filter((entry): entry is RawStorageEntry => entry !== null);
+async function loadQueryEntries(storagePath: string, queryTerms: string[]) {
+  const bucketKeys = Array.from(
+    new Set(
+      queryTerms
+        .map((term) => resolveBucketKey(term))
+        .filter((bucketKey): bucketKey is string => bucketKey !== null)
+    )
+  );
 
-  cachedPath = storagePath;
-  cachedMtimeMs = fileStats.mtimeMs;
-  cachedEntries = entries;
+  const buckets = await Promise.all(
+    bucketKeys.map((bucketKey) => readBucketEntries(resolveBucketPath(storagePath, bucketKey)))
+  );
 
-  return entries;
+  return buckets.flat();
+}
+
+async function clearExistingBucketFiles(storageDir: string) {
+  try {
+    const entries = await readdir(storageDir, { withFileTypes: true });
+    await Promise.all(entries.map(async (entry) => {
+      if (!entry.isFile() || !bucketFilePattern.test(entry.name)) {
+        return;
+      }
+      await unlink(join(storageDir, entry.name));
+    }));
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function hasBucketSnapshot(storagePath: string) {
+  const storageDir = resolveStorageDirectory(storagePath);
+
+  try {
+    const entries = await readdir(storageDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !bucketFilePattern.test(entry.name)) {
+        continue;
+      }
+
+      const fileStats = await stat(join(storageDir, entry.name));
+      if (fileStats.size > 0) {
+        return true;
+      }
+    }
+
+    return false;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export function computeRelevanceScore(frequency: number, depth: number, exactMatch: boolean) {
@@ -77,91 +144,66 @@ export function computeRelevanceScore(frequency: number, depth: number, exactMat
 }
 
 export async function searchRawStorage(storagePath: string, query: string): Promise<RawStorageSearchResult[]> {
-  const queryTerms = Array.from(tokenize(query).keys());
-  if (queryTerms.length === 0) {
-    return [];
-  }
-
-  const entries = await loadRawStorageEntries(storagePath);
-  const grouped = new Map<string, {
-    relevant_url: string;
-    origin_url: string;
-    depth: number;
-    matched_frequency: number;
-    matched_terms: Set<string>;
-  }>();
-
-  for (const entry of entries) {
-    if (!queryTerms.includes(entry.word)) {
-      continue;
+  return rawStorageMutex.runExclusive(async () => {
+    const queryTerms = Array.from(tokenize(query).keys());
+    if (queryTerms.length === 0) {
+      return [];
     }
 
-    const key = `${entry.url}\n${entry.origin}\n${entry.depth}`;
-    let group = grouped.get(key);
-    if (!group) {
-      group = {
-        relevant_url: entry.url,
-        origin_url: entry.origin,
-        depth: entry.depth,
-        matched_frequency: 0,
-        matched_terms: new Set<string>()
-      };
-      grouped.set(key, group);
-    }
+    const queryTermsSet = new Set(queryTerms);
+    const entries = await loadQueryEntries(storagePath, queryTerms);
+    const grouped = new Map<string, {
+      relevant_url: string;
+      origin_url: string;
+      depth: number;
+      matched_frequency: number;
+      matched_terms: Set<string>;
+    }>();
 
-    group.matched_frequency += entry.frequency;
-    group.matched_terms.add(entry.word);
-  }
-
-  return Array.from(grouped.values())
-    .map((group) => ({
-      relevant_url: group.relevant_url,
-      origin_url: group.origin_url,
-      depth: group.depth,
-      matched_frequency: group.matched_frequency,
-      relevance_score: computeRelevanceScore(
-        group.matched_frequency,
-        group.depth,
-        group.matched_terms.size === queryTerms.length
-      )
-    }))
-    .sort((left, right) => {
-      if (right.relevance_score !== left.relevance_score) {
-        return right.relevance_score - left.relevance_score;
+    for (const entry of entries) {
+      if (!queryTermsSet.has(entry.word)) {
+        continue;
       }
-      if (right.matched_frequency !== left.matched_frequency) {
-        return right.matched_frequency - left.matched_frequency;
+
+      const key = `${entry.url}\n${entry.origin}\n${entry.depth}`;
+      let group = grouped.get(key);
+      if (!group) {
+        group = {
+          relevant_url: entry.url,
+          origin_url: entry.origin,
+          depth: entry.depth,
+          matched_frequency: 0,
+          matched_terms: new Set<string>()
+        };
+        grouped.set(key, group);
       }
-      return left.relevant_url.localeCompare(right.relevant_url);
-    });
-}
 
-async function resolveExportJobId(
-  db: Database<sqlite3.Database, sqlite3.Statement>,
-  preferredJobId?: string
-) {
-  if (preferredJobId) {
-    const preferred = await db.get<{ count: number }>(
-      "SELECT COUNT(*) as count FROM page_terms WHERE job_id = ?",
-      preferredJobId
-    );
-    if ((preferred?.count ?? 0) > 0) {
-      return preferredJobId;
+      group.matched_frequency += entry.frequency;
+      group.matched_terms.add(entry.word);
     }
-  }
 
-  const row = await db.get<{ job_id: string }>(`
-    SELECT pt.job_id as job_id
-    FROM page_terms pt
-    JOIN crawl_jobs cj ON cj.id = pt.job_id
-    WHERE cj.status IN ('completed', 'stopped')
-    GROUP BY pt.job_id
-    HAVING COUNT(*) > 0
-    ORDER BY COUNT(*) ASC, MAX(cj.created_at) DESC
-    LIMIT 1
-  `);
-
-  return row?.job_id ?? null;
+    return Array.from(grouped.values())
+      .map((group) => ({
+        relevant_url: group.relevant_url,
+        origin_url: group.origin_url,
+        depth: group.depth,
+        matched_frequency: group.matched_frequency,
+        relevance_score: computeRelevanceScore(
+          group.matched_frequency,
+          group.depth,
+          group.matched_terms.size === queryTerms.length
+        )
+      }))
+      .sort((left, right) => {
+        if (right.relevance_score !== left.relevance_score) {
+          return right.relevance_score - left.relevance_score;
+        }
+        if (right.matched_frequency !== left.matched_frequency) {
+          return right.matched_frequency - left.matched_frequency;
+        }
+        return left.relevant_url.localeCompare(right.relevant_url);
+      });
+  });
 }
 
 export async function exportRawStorageSnapshot(
@@ -169,49 +211,71 @@ export async function exportRawStorageSnapshot(
   storagePath: string,
   preferredJobId?: string
 ) {
-  const jobId = await resolveExportJobId(db, preferredJobId);
-  await mkdir(dirname(storagePath), { recursive: true });
+  return rawStorageMutex.runExclusive(async () => {
+    const storageDir = resolveStorageDirectory(storagePath);
+    await mkdir(storageDir, { recursive: true });
 
-  if (!jobId) {
-    await writeFile(storagePath, "", "utf8");
-    cachedPath = "";
-    cachedEntries = [];
-    cachedMtimeMs = -1;
-    return { jobId: null, lineCount: 0 };
-  }
+    const rows = await db.all<{
+      job_id: string;
+      word: string;
+      url: string;
+      origin: string;
+      depth: number;
+      frequency: number;
+    }[]>(
+      `
+        SELECT pt.job_id as job_id,
+               t.term as word,
+               p.url as url,
+               jp.origin_url as origin,
+               jp.depth as depth,
+               pt.frequency as frequency
+        FROM page_terms pt
+        JOIN terms t ON t.id = pt.term_id
+        JOIN pages p ON p.id = pt.page_id
+        JOIN job_pages jp ON jp.job_id = pt.job_id AND jp.page_id = pt.page_id
+        ${preferredJobId ? "WHERE pt.job_id = ?" : ""}
+        ORDER BY t.term, p.url, jp.origin_url, jp.depth
+      `,
+      ...(preferredJobId ? [preferredJobId] : [])
+    );
 
-  const rows = await db.all<{
-    word: string;
-    url: string;
-    origin: string;
-    depth: number;
-    frequency: number;
-  }[]>(
-    `
-      SELECT t.term as word,
-             p.url as url,
-             jp.origin_url as origin,
-             jp.depth as depth,
-             pt.frequency as frequency
-      FROM page_terms pt
-      JOIN terms t ON t.id = pt.term_id
-      JOIN pages p ON p.id = pt.page_id
-      JOIN job_pages jp ON jp.job_id = pt.job_id AND jp.page_id = pt.page_id
-      WHERE pt.job_id = ?
-      ORDER BY t.term, p.url, jp.origin_url, jp.depth
-    `,
-    jobId
-  );
+    const buckets = new Map<string, string[]>();
+    const jobIds = new Set<string>();
 
-  const contents = rows
-    .map((row) => `${row.word} ${row.url} ${row.origin} ${row.depth} ${row.frequency}`)
-    .join("\n");
+    for (const row of rows) {
+      const bucketKey = resolveBucketKey(row.word);
+      if (!bucketKey) {
+        continue;
+      }
 
-  await writeFile(storagePath, contents.length > 0 ? `${contents}\n` : "", "utf8");
-  cachedPath = "";
-  cachedEntries = [];
-  cachedMtimeMs = -1;
-  return { jobId, lineCount: rows.length };
+      let lines = buckets.get(bucketKey);
+      if (!lines) {
+        lines = [];
+        buckets.set(bucketKey, lines);
+      }
+
+      lines.push(`${row.word} ${row.url} ${row.origin} ${row.depth} ${row.frequency}`);
+      jobIds.add(row.job_id);
+    }
+
+    await clearExistingBucketFiles(storageDir);
+
+    const bucketEntries = Array.from(buckets.entries()).sort(([left], [right]) => left.localeCompare(right));
+    for (const [bucketKey, lines] of bucketEntries) {
+      const bucketPath = resolveBucketPath(storageDir, bucketKey);
+      const contents = `${lines.join("\n")}\n`;
+      await writeFile(bucketPath, contents, "utf8");
+    }
+
+    return {
+      jobId: preferredJobId ?? null,
+      jobCount: jobIds.size,
+      lineCount: rows.length,
+      bucketCount: bucketEntries.length,
+      storageDir
+    };
+  });
 }
 
 export async function ensureRawStorageSnapshot(
@@ -219,13 +283,9 @@ export async function ensureRawStorageSnapshot(
   storagePath: string,
   preferredJobId?: string
 ) {
-  try {
-    const existing = await stat(storagePath);
-    if (existing.size > 0) {
-      return { created: false };
-    }
-  } catch {
-    // Create the file from the database if it does not exist yet.
+  const existing = await rawStorageMutex.runExclusive(async () => hasBucketSnapshot(storagePath));
+  if (existing) {
+    return { created: false };
   }
 
   const result = await exportRawStorageSnapshot(db, storagePath, preferredJobId);

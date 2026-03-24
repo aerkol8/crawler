@@ -2,6 +2,7 @@ import { Database } from "sqlite";
 import sqlite3 from "sqlite3";
 import { randomUUID } from "crypto";
 import { config } from "../config";
+import { exportRawStorageSnapshot } from "../storage/rawStorage";
 import { FrontierQueue, FrontierItem } from "./frontier";
 import { WorkerPool } from "./workerPool";
 import { normalizeUrl, parseHtml } from "./parser";
@@ -177,6 +178,7 @@ export class CrawlerManager {
     }
 
     this.cleanupJobRuntime(jobId);
+    await this.refreshRawStorageSnapshot();
     this.onJobUpdated?.(jobId);
     return true;
   }
@@ -237,6 +239,8 @@ export class CrawlerManager {
 
       if (pageRow?.fetched_at) {
         await this.insertJobPage(jobId, pageRow.id, originUrl, item.depth);
+        await this.copyIndexedTermsToJob(jobId, pageRow.id);
+        await this.refreshRawStorageSnapshot();
         await frontier.markDone(item.id);
         await this.incrementProcessed(jobId);
         return;
@@ -258,6 +262,7 @@ export class CrawlerManager {
 
       await this.insertJobPage(jobId, pageId, originUrl, item.depth);
       await this.indexTerms(jobId, pageId, parsed.termCounts);
+      await this.refreshRawStorageSnapshot();
 
       if (!this.isStopRequested(jobId) && item.depth < maxDepth) {
         for (const link of parsed.links) {
@@ -284,6 +289,14 @@ export class CrawlerManager {
     } finally {
       await this.updateJobStats(jobId, frontier, this.pools.get(jobId));
     }
+  }
+
+  private async refreshRawStorageSnapshot() {
+    await exportRawStorageSnapshot(
+      this.db,
+      config.rawStoragePath,
+      config.rawStorageJobId || undefined
+    );
   }
 
   private async fetchPage(jobId: string, url: string) {
@@ -382,6 +395,22 @@ export class CrawlerManager {
       await this.db.exec("ROLLBACK;");
       throw error;
     }
+  }
+
+  private async copyIndexedTermsToJob(jobId: string, pageId: number) {
+    await this.db.run(
+      `
+        INSERT INTO page_terms (job_id, page_id, term_id, frequency)
+        SELECT ?, ?, pt.term_id, MAX(pt.frequency)
+        FROM page_terms pt
+        WHERE pt.page_id = ?
+        GROUP BY pt.term_id
+        ON CONFLICT(job_id, page_id, term_id) DO UPDATE SET frequency = excluded.frequency
+      `,
+      jobId,
+      pageId,
+      pageId
+    );
   }
 
   private async incrementProcessed(jobId: string) {

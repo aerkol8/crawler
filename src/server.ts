@@ -5,7 +5,7 @@ import { getDb } from "./db";
 import { CrawlerManager } from "./crawler/manager";
 import { SearchService } from "./search/searchService";
 import { UpdateBus } from "./live/updateBus";
-import { ensureRawStorageSnapshot, searchRawStorage } from "./storage/rawStorage";
+import { exportRawStorageSnapshot, searchRawStorage } from "./storage/rawStorage";
 import { renderHome, renderSearch, renderStatus } from "./ui/templates";
 
 function initializeEventStream(res: Response) {
@@ -45,10 +45,10 @@ async function main() {
   const db = await getDb();
   const updateBus = new UpdateBus();
   const manager = new CrawlerManager(db, (jobId) => updateBus.publishJob(jobId));
-  const searchService = new SearchService(db);
+  const searchService = new SearchService(config.rawStoragePath);
 
   await manager.resumeIncompleteJobs();
-  await ensureRawStorageSnapshot(db, config.rawStoragePath, config.rawStorageJobId || undefined);
+  await exportRawStorageSnapshot(db, config.rawStoragePath, config.rawStorageJobId || undefined);
 
   const app = express();
   app.use(express.urlencoded({ extended: true }));
