@@ -1,7 +1,12 @@
 import { Database } from "sqlite";
 import sqlite3 from "sqlite3";
-import { randomUUID } from "crypto";
+import { threadId } from "node:worker_threads";
 import { config } from "../config";
+import {
+  CrawlerArtifactsStore,
+  CrawlerArtifactLogEntry,
+  CrawlerArtifactQueueEntry
+} from "../storage/jobArtifacts";
 import { exportRawStorageSnapshot } from "../storage/rawStorage";
 import { FrontierQueue, FrontierItem } from "./frontier";
 import { WorkerPool } from "./workerPool";
@@ -25,11 +30,34 @@ export type JobStatus = {
   updatedAt: string;
 };
 
+export type JobDetail = JobStatus & {
+  createdAt: string;
+  createdAtEpoch: number;
+  threadId: number;
+  currentUrl: string | null;
+  lastError: string | null;
+  queuedUrls: CrawlerArtifactQueueEntry[];
+  logs: CrawlerArtifactLogEntry[];
+};
+
+type FetchResult =
+  | {
+      ok: true;
+      html: string;
+      status: number;
+    }
+  | {
+      ok: false;
+      reason: "http_error" | "body_too_large" | "request_failed";
+      status: number;
+    };
+
 export class CrawlerManager {
   private readonly pools = new Map<string, WorkerPool>();
   private readonly frontiers = new Map<string, FrontierQueue>();
   private readonly stoppingJobs = new Set<string>();
   private readonly fetchControllers = new Map<string, Set<AbortController>>();
+  private readonly artifacts = new CrawlerArtifactsStore();
 
   constructor(
     private readonly db: Database<sqlite3.Database, sqlite3.Statement>,
@@ -37,8 +65,17 @@ export class CrawlerManager {
   ) {}
 
   async startJob(originUrl: string, maxDepth: number): Promise<CrawlJob> {
-    const jobId = randomUUID();
-    const now = new Date().toISOString();
+    await this.artifacts.syncVisitedUrlsFromDb(this.db);
+
+    const threadToken = threadId || process.pid;
+    let createdAtEpoch = Date.now();
+    let jobId = `${createdAtEpoch}_${threadToken}`;
+    while (await this.db.get("SELECT id FROM crawl_jobs WHERE id = ?", jobId)) {
+      createdAtEpoch += 1;
+      jobId = `${createdAtEpoch}_${threadToken}`;
+    }
+
+    const now = new Date(createdAtEpoch).toISOString();
 
     await this.db.run(
       "INSERT INTO crawl_jobs (id, origin_url, max_depth, status, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?)",
@@ -49,26 +86,54 @@ export class CrawlerManager {
       now
     );
 
+    await this.artifacts.initializeJob({
+      jobId,
+      originUrl,
+      maxDepth,
+      createdAt: now,
+      createdAtEpoch,
+      threadId: threadToken
+    });
+
     const frontier = new FrontierQueue(jobId, this.db, config.maxQueue);
     await frontier.init();
     await frontier.enqueue(originUrl, 0);
 
     this.frontiers.set(jobId, frontier);
+    await this.artifacts.updateJob(this.db, jobId, {
+      log: this.createArtifactLog("info", "Seed URL queued", {
+        url: originUrl,
+        depth: 0
+      })
+    });
     this.startPool(jobId, frontier, originUrl, maxDepth);
 
     return { id: jobId, originUrl, maxDepth };
   }
 
   async resumeIncompleteJobs() {
+    await this.artifacts.syncVisitedUrlsFromDb(this.db);
+
     await this.db.run(
       "UPDATE frontier SET status = 'pending' WHERE status = 'processing'"
     );
 
-    const stoppingJobs = await this.db.all<{ id: string }[]>(
-      "SELECT id FROM crawl_jobs WHERE status = 'stopping'"
+    const stoppingJobs = await this.db.all<{
+      id: string;
+      origin_url: string;
+      max_depth: number;
+      created_at: string;
+    }[]>(
+      "SELECT id, origin_url, max_depth, created_at FROM crawl_jobs WHERE status = 'stopping'"
     );
 
     for (const job of stoppingJobs) {
+      await this.initializeArtifactsForExistingJob(
+        job.id,
+        job.origin_url,
+        job.max_depth,
+        job.created_at
+      );
       const frontier = new FrontierQueue(job.id, this.db, config.maxQueue);
       await frontier.init();
       await frontier.markStopped();
@@ -77,14 +142,32 @@ export class CrawlerManager {
         new Date().toISOString(),
         job.id
       );
+      await this.artifacts.updateJob(this.db, job.id, {
+        status: "stopped",
+        queuedCount: 0,
+        activeWorkers: 0,
+        currentUrl: null,
+        log: this.createArtifactLog("info", "Crawler job recovered in stopped state after restart")
+      });
       this.onJobUpdated?.(job.id);
     }
 
-    const jobs = await this.db.all<{ id: string; origin_url: string; max_depth: number }[]>(
-      "SELECT id, origin_url, max_depth FROM crawl_jobs WHERE status = 'running'"
+    const jobs = await this.db.all<{
+      id: string;
+      origin_url: string;
+      max_depth: number;
+      created_at: string;
+    }[]>(
+      "SELECT id, origin_url, max_depth, created_at FROM crawl_jobs WHERE status = 'running'"
     );
 
     for (const job of jobs) {
+      await this.initializeArtifactsForExistingJob(
+        job.id,
+        job.origin_url,
+        job.max_depth,
+        job.created_at
+      );
       const frontier = new FrontierQueue(job.id, this.db, config.maxQueue);
       await frontier.init();
       await frontier.refillPendingFromProcessing();
@@ -130,6 +213,31 @@ export class CrawlerManager {
       errorCount: row.error_count,
       activeWorkers: row.active_workers,
       updatedAt: row.updated_at
+    };
+  }
+
+  async getJobDetail(jobId: string): Promise<JobDetail | null> {
+    const job = await this.getJob(jobId);
+    if (!job) {
+      return null;
+    }
+
+    const artifact = await this.artifacts.getJob(jobId);
+    const match = /^(\d+)_(\d+)$/.exec(jobId);
+    const createdAtEpoch = artifact?.createdAtEpoch
+      ?? (match ? Number.parseInt(match[1], 10) : Date.parse(job.updatedAt));
+    const parsedThreadId = artifact?.threadId
+      ?? (match ? Number.parseInt(match[2], 10) : 0);
+
+    return {
+      ...job,
+      createdAt: artifact?.createdAt ?? job.updatedAt,
+      createdAtEpoch: Number.isNaN(createdAtEpoch) ? Date.now() : createdAtEpoch,
+      threadId: parsedThreadId,
+      currentUrl: artifact?.currentUrl ?? null,
+      lastError: artifact?.lastError ?? null,
+      queuedUrls: artifact?.queuedUrls ?? [],
+      logs: artifact?.logs ?? []
     };
   }
 
@@ -179,6 +287,7 @@ export class CrawlerManager {
 
     this.cleanupJobRuntime(jobId);
     await this.refreshRawStorageSnapshot();
+    await this.artifacts.removeJob(jobId);
     this.onJobUpdated?.(jobId);
     return true;
   }
@@ -222,13 +331,36 @@ export class CrawlerManager {
     item: FrontierItem
   ) {
     try {
+      await this.artifacts.updateJob(this.db, jobId, {
+        currentUrl: item.url,
+        lastError: null,
+        log: this.createArtifactLog("info", "Processing URL", {
+          url: item.url,
+          depth: item.depth
+        })
+      });
+
       if (this.isStopRequested(jobId)) {
         await frontier.markFailed(item.id, "stopped");
+        await this.artifacts.updateJob(this.db, jobId, {
+          currentUrl: null,
+          log: this.createArtifactLog("info", "Skipped queued URL because stop was requested", {
+            url: item.url
+          })
+        });
         return;
       }
 
       if (item.depth > maxDepth) {
         await frontier.markDone(item.id);
+        await this.artifacts.updateJob(this.db, jobId, {
+          currentUrl: null,
+          log: this.createArtifactLog("info", "Skipped URL beyond max depth", {
+            url: item.url,
+            depth: item.depth,
+            maxDepth
+          })
+        });
         return;
       }
 
@@ -236,34 +368,62 @@ export class CrawlerManager {
         "SELECT id, fetched_at FROM pages WHERE url = ?",
         item.url
       );
+      const alreadyVisited = await this.artifacts.hasVisitedUrl(item.url);
 
       if (pageRow?.fetched_at) {
+        if (!alreadyVisited) {
+          await this.artifacts.markVisitedUrl(item.url);
+        }
         await this.insertJobPage(jobId, pageRow.id, originUrl, item.depth);
         await this.copyIndexedTermsToJob(jobId, pageRow.id);
         await this.refreshRawStorageSnapshot();
         await frontier.markDone(item.id);
         await this.incrementProcessed(jobId);
+        await this.artifacts.updateJob(this.db, jobId, {
+          currentUrl: null,
+          log: this.createArtifactLog("info", "Reused previously visited page", {
+            url: item.url,
+            depth: item.depth
+          })
+        });
         return;
       }
 
       const fetched = await this.fetchPage(jobId, item.url);
-      if (!fetched) {
+      if (!fetched.ok) {
         if (this.isStopRequested(jobId)) {
           await frontier.markFailed(item.id, "stopped");
+          await this.artifacts.updateJob(this.db, jobId, {
+            currentUrl: null,
+            log: this.createArtifactLog("info", "Stopped while fetching URL", {
+              url: item.url
+            })
+          });
           return;
         }
         await frontier.markFailed(item.id, "fetch_failed");
         await this.incrementError(jobId);
+        await this.artifacts.updateJob(this.db, jobId, {
+          currentUrl: null,
+          lastError: fetched.reason,
+          log: this.createArtifactLog("error", "Fetch failed", {
+            url: item.url,
+            status: fetched.status,
+            reason: fetched.reason
+          })
+        });
         return;
       }
 
       const parsed = parseHtml(fetched.html, item.url);
       const pageId = await this.upsertPage(item.url, parsed.title);
+      await this.artifacts.markVisitedUrl(item.url);
 
       await this.insertJobPage(jobId, pageId, originUrl, item.depth);
       await this.indexTerms(jobId, pageId, parsed.termCounts);
       await this.refreshRawStorageSnapshot();
 
+      let enqueuedChildren = 0;
       if (!this.isStopRequested(jobId) && item.depth < maxDepth) {
         for (const link of parsed.links) {
           const normalized = normalizeUrl(link);
@@ -273,19 +433,48 @@ export class CrawlerManager {
           const childDepth = item.depth + 1;
           await this.ensurePageRow(normalized);
           await this.insertJobPageByUrl(jobId, normalized, originUrl, childDepth);
-          await frontier.enqueue(normalized, childDepth);
+          const enqueued = await frontier.enqueue(normalized, childDepth);
+          if (enqueued) {
+            enqueuedChildren += 1;
+          }
         }
       }
 
       await frontier.markDone(item.id);
       await this.incrementProcessed(jobId);
+      await this.artifacts.updateJob(this.db, jobId, {
+        currentUrl: null,
+        log: this.createArtifactLog("info", "Fetched and indexed page", {
+          url: item.url,
+          status: fetched.status,
+          depth: item.depth,
+          uniqueTerms: parsed.termCounts.size,
+          discoveredLinks: parsed.links.length,
+          queuedChildren: enqueuedChildren
+        })
+      });
     } catch (error) {
       if (this.isStopRequested(jobId)) {
         await frontier.markFailed(item.id, "stopped");
+        await this.artifacts.updateJob(this.db, jobId, {
+          currentUrl: null,
+          log: this.createArtifactLog("info", "Stopped while processing URL", {
+            url: item.url
+          })
+        });
         return;
       }
       await frontier.markFailed(item.id, "exception");
       await this.incrementError(jobId);
+      const message = error instanceof Error ? error.message : "Unexpected crawler exception";
+      await this.artifacts.updateJob(this.db, jobId, {
+        currentUrl: null,
+        lastError: message,
+        log: this.createArtifactLog("error", "Unhandled crawler exception", {
+          url: item.url,
+          message
+        })
+      });
     } finally {
       await this.updateJobStats(jobId, frontier, this.pools.get(jobId));
     }
@@ -299,7 +488,7 @@ export class CrawlerManager {
     );
   }
 
-  private async fetchPage(jobId: string, url: string) {
+  private async fetchPage(jobId: string, url: string): Promise<FetchResult> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
     this.registerFetchController(jobId, controller);
@@ -311,19 +500,36 @@ export class CrawlerManager {
           "User-Agent": config.userAgent
         }
       });
+      const status = typeof response.status === "number" ? response.status : (response.ok ? 200 : 0);
 
       if (!response.ok) {
-        return null;
+        return {
+          ok: false,
+          status,
+          reason: "http_error"
+        };
       }
 
       const text = await response.text();
       if (text.length > config.maxBodyBytes) {
-        return null;
+        return {
+          ok: false,
+          status,
+          reason: "body_too_large"
+        };
       }
 
-      return { html: text };
+      return {
+        ok: true,
+        html: text,
+        status
+      };
     } catch {
-      return null;
+      return {
+        ok: false,
+        status: 0,
+        reason: "request_failed"
+      };
     } finally {
       clearTimeout(timeout);
       this.unregisterFetchController(jobId, controller);
@@ -458,6 +664,22 @@ export class CrawlerManager {
       jobId
     );
 
+    await this.artifacts.updateJob(this.db, jobId, {
+      status,
+      queuedCount,
+      activeWorkers,
+      currentUrl: status === "completed" || status === "stopped" ? null : undefined,
+      log: status !== existing.status
+        ? this.createArtifactLog(
+            "info",
+            status === "completed" ? "Crawler job completed"
+              : status === "stopped" ? "Crawler job stopped"
+                : status === "stopping" ? "Crawler job stopping"
+                  : "Crawler job running"
+          )
+        : undefined
+    });
+
     if (status === "completed") {
       this.cleanupJobRuntime(jobId);
     }
@@ -486,6 +708,13 @@ export class CrawlerManager {
       new Date().toISOString(),
       jobId
     );
+
+    await this.artifacts.updateJob(this.db, jobId, {
+      status: "stopping",
+      queuedCount,
+      activeWorkers,
+      log: this.createArtifactLog("info", "Stop requested for crawler job")
+    });
 
     this.onJobUpdated?.(jobId);
   }
@@ -526,6 +755,16 @@ export class CrawlerManager {
       new Date().toISOString(),
       jobId
     );
+
+    await this.artifacts.updateJob(this.db, jobId, {
+      status,
+      queuedCount,
+      activeWorkers,
+      currentUrl: status === "stopped" ? null : undefined,
+      log: status === "stopped" && job.status !== "stopped"
+        ? this.createArtifactLog("info", "Crawler job stopped")
+        : undefined
+    });
 
     if (status === "stopped") {
       this.cleanupJobRuntime(jobId);
@@ -579,5 +818,38 @@ export class CrawlerManager {
     for (const jobId of this.fetchControllers.keys()) {
       this.abortFetchesForJob(jobId);
     }
+  }
+
+  private async initializeArtifactsForExistingJob(
+    jobId: string,
+    originUrl: string,
+    maxDepth: number,
+    createdAt: string
+  ) {
+    const match = /^(\d+)_(\d+)$/.exec(jobId);
+    const createdAtEpoch = match ? Number.parseInt(match[1], 10) : Date.parse(createdAt);
+    const parsedThreadId = match ? Number.parseInt(match[2], 10) : 0;
+
+    await this.artifacts.initializeJob({
+      jobId,
+      originUrl,
+      maxDepth,
+      createdAt,
+      createdAtEpoch: Number.isNaN(createdAtEpoch) ? Date.now() : createdAtEpoch,
+      threadId: parsedThreadId || threadId || process.pid
+    });
+  }
+
+  private createArtifactLog(
+    level: "info" | "error",
+    message: string,
+    data?: Record<string, unknown>
+  ) {
+    return {
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      ...(data ? { data } : {})
+    };
   }
 }

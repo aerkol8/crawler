@@ -41,12 +41,15 @@ The implementation is intentionally biased toward simple, inspectable building b
 - Live dashboard updates over Server-Sent Events for job status, queue depth, processed count, and throttling state.
 - Live search updates over Server-Sent Events so results refresh as the index grows.
 - Resume incomplete crawl jobs after restart, with automated verification for pending-frontier recovery.
+- Each crawl also writes a spec-style JSON artifact at `data/jobs/[epoch_threadId].data`, including logs and the queued URL snapshot.
+- A shared `data/visited_urls.data` file mirrors already fetched pages so duplicate URLs can be skipped across jobs.
 - Filesystem term buckets are exported under `data/storage`, for example `data/storage/p.data` for words starting with `p`.
 - Compatibility search route at `GET /search?query=<word>&sortBy=relevance` with `relevance_score`.
 
 ## Architecture
 
 - `CrawlerManager` owns crawl jobs, persistence updates, and job lifecycle transitions.
+- `CrawlerArtifactsStore` mirrors job state into filesystem `.data` artifacts and maintains `visited_urls.data`.
 - `FrontierQueue` stores crawl frontier state in SQLite and keeps a bounded in-memory working set for efficient dequeue.
 - `WorkerPool` enforces concurrency and rate limits while coordinating worker execution safely.
 - `SearchService` queries the live index and returns triples in the form `(relevant_url, origin_url, depth)`.
@@ -64,6 +67,8 @@ The implementation is intentionally biased toward simple, inspectable building b
 ## Question Compatibility
 
 - The repository includes a sample raw storage bucket at `data/storage/p.data`.
+- Crawl job IDs are emitted in `[EpochTimeCreated_ThreadID]` style, for example `1742852390123_91234`.
+- Each job writes `data/jobs/[crawlerId].data` with status, logs, and the current queue snapshot.
 - The compatibility search API returns JSON results with `relevant_url`, `origin_url`, `depth`, `matched_frequency`, and `relevance_score`.
 - The compatibility scoring formula is:
   - `(frequency * 10) + 1000 - (depth * 5)` for exact single-word matches.
@@ -85,6 +90,9 @@ The implementation is intentionally biased toward simple, inspectable building b
 Environment variables:
 
 - PORT: HTTP port (default 3600)
+- CRAWLER_DATA_DIR: base directory for crawler artifacts (default `./data`)
+- CRAWLER_JOB_DATA_PATH: crawler job artifact directory (default `./data/jobs`)
+- VISITED_URLS_PATH: newline-delimited visited URL snapshot (default `./data/visited_urls.data`)
 - RAW_STORAGE_PATH: raw storage export directory for question-compatible search (default `./data/storage`)
 - RAW_STORAGE_JOB_ID: optional job ID to export into the raw storage snapshot
 - DB_PATH: SQLite database file (default ./crawler.db)

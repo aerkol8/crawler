@@ -96,7 +96,7 @@ async function main() {
   });
 
   app.get("/status/:jobId", async (req, res) => {
-    const job = await manager.getJob(req.params.jobId);
+    const job = await manager.getJobDetail(req.params.jobId);
     if (!job) {
       res.status(404).send("Not found");
       return;
@@ -156,7 +156,7 @@ async function main() {
   });
 
   app.get("/api/status/:jobId", async (req, res) => {
-    const job = await manager.getJob(req.params.jobId);
+    const job = await manager.getJobDetail(req.params.jobId);
     if (!job) {
       res.status(404).json({ error: "Not found" });
       return;
@@ -207,7 +207,7 @@ async function main() {
     const { jobId } = req.params;
     const heartbeat = attachHeartbeat(res);
     const sendJob = createSerializedSender(async () => {
-      const job = await manager.getJob(jobId);
+      const job = await manager.getJobDetail(jobId);
       if (job) {
         writeEvent(res, "job", job);
       }

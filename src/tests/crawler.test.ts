@@ -1,6 +1,6 @@
 import { test, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
@@ -10,6 +10,7 @@ import type { CrawlerManager } from "../crawler/manager";
 
 type MockResponse = {
   ok: boolean;
+  status?: number;
   text: () => Promise<string>;
 };
 
@@ -44,14 +45,17 @@ function createFetchStub(pages: Record<string, string>, delaysMs?: Record<string
     }
 
     if (!html) {
-      return { ok: false, text: async () => "" };
+      return { ok: false, status: 404, text: async () => "" };
     }
-    return { ok: true, text: async () => html };
+    return { ok: true, status: 200, text: async () => html };
   };
 }
 
 let dbPath = "";
+let crawlerDataDir = "";
 let storagePath = "";
+let jobsPath = "";
+let visitedUrlsPath = "";
 let db: Database<sqlite3.Database, sqlite3.Statement>;
 const managers: CrawlerManager[] = [];
 const serial = { concurrency: false };
@@ -72,8 +76,14 @@ async function resetDb() {
 
 before(async () => {
   dbPath = `./test-${Date.now()}.db`;
-  storagePath = mkdtempSync(join(tmpdir(), "crawler-storage-test-"));
+  crawlerDataDir = mkdtempSync(join(tmpdir(), "crawler-data-test-"));
+  jobsPath = join(crawlerDataDir, "jobs");
+  storagePath = join(crawlerDataDir, "storage");
+  visitedUrlsPath = join(crawlerDataDir, "visited_urls.data");
   process.env.DB_PATH = dbPath;
+  process.env.CRAWLER_DATA_DIR = crawlerDataDir;
+  process.env.CRAWLER_JOB_DATA_PATH = jobsPath;
+  process.env.VISITED_URLS_PATH = visitedUrlsPath;
   process.env.RAW_STORAGE_PATH = storagePath;
   process.env.MAX_QUEUE = "10";
   process.env.MAX_CONCURRENT = "2";
@@ -87,7 +97,7 @@ before(async () => {
 
 beforeEach(async () => {
   await resetDb();
-  rmSync(storagePath, { recursive: true, force: true });
+  rmSync(crawlerDataDir, { recursive: true, force: true });
 });
 
 afterEach(() => {
@@ -100,7 +110,7 @@ afterEach(() => {
 after(async () => {
   await db.close();
   rmSync(dbPath, { force: true });
-  rmSync(storagePath, { recursive: true, force: true });
+  rmSync(crawlerDataDir, { recursive: true, force: true });
 });
 
 test("normalizeUrl handles base URLs and rejects non-http", serial, async () => {
@@ -180,6 +190,71 @@ test("depth limit enforcement stops beyond max depth", serial, async () => {
   const rows = await db.all<{ depth: number }[]>("SELECT depth FROM job_pages WHERE job_id = ?", job.id);
   assert.deepEqual(rows.map((row) => row.depth), [0]);
 
+});
+
+test("crawler writes file-based job artifacts and visited URL snapshot", serial, async () => {
+  const { CrawlerManager } = await import("../crawler/manager");
+
+  const pages = {
+    "https://example.com": "<html><body>root token <a href='https://example.com/a'>A</a></body></html>",
+    "https://example.com/a": "<html><body>child token</body></html>"
+  };
+  globalThis.fetch = createFetchStub(pages) as any;
+
+  const manager = new CrawlerManager(db);
+  registerManager(manager);
+  const job = await manager.startJob("https://example.com", 1);
+
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const status = await manager.getJob(job.id);
+    if (status?.status === "completed") {
+      break;
+    }
+    await delay(50);
+  }
+
+  const artifactPath = join(jobsPath, `${job.id}.data`);
+  assert.match(job.id, /^\d+_\d+$/);
+  assert.equal(existsSync(artifactPath), true);
+  assert.equal(existsSync(visitedUrlsPath), true);
+
+  const artifact = JSON.parse(readFileSync(artifactPath, "utf8")) as {
+    id: string;
+    createdAtEpoch: number;
+    threadId: number;
+    status: string;
+    processedCount: number;
+    currentUrl: string | null;
+    queuedUrls: Array<{ url: string; depth: number; status: string }>;
+    visitedUrlsPath: string;
+    storagePath: string;
+    logs: Array<{ message: string }>;
+  };
+  const [epochToken, threadToken] = job.id.split("_");
+
+  assert.equal(artifact.id, job.id);
+  assert.equal(artifact.createdAtEpoch, Number.parseInt(epochToken, 10));
+  assert.equal(artifact.threadId, Number.parseInt(threadToken, 10));
+  assert.equal(artifact.status, "completed");
+  assert.equal(artifact.processedCount, 2);
+  assert.equal(artifact.currentUrl, null);
+  assert.deepEqual(artifact.queuedUrls, []);
+  assert.equal(artifact.visitedUrlsPath, visitedUrlsPath);
+  assert.equal(artifact.storagePath, storagePath);
+  assert.ok(artifact.logs.some((entry) => entry.message === "Crawler job created"));
+  assert.ok(artifact.logs.some((entry) => entry.message === "Fetched and indexed page"));
+
+  const visitedUrls = new Set(
+    readFileSync(visitedUrlsPath, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+  );
+  assert.deepEqual(
+    Array.from(visitedUrls).sort(),
+    ["https://example.com", "https://example.com/a"]
+  );
 });
 
 test("search works while indexing is active", serial, async () => {
@@ -276,7 +351,7 @@ test("stopJob halts an active crawl and marks it stopped", serial, async () => {
     "https://example.com": "<html><body>root <a href='https://example.com/slow'>slow</a></body></html>",
     "https://example.com/slow": "<html><body>slow page</body></html>"
   };
-  globalThis.fetch = createFetchStub(pages, { "https://example.com/slow": 1000 }) as any;
+  globalThis.fetch = createFetchStub(pages, { "https://example.com/slow": 3000 }) as any;
 
   const manager = new CrawlerManager(db);
   registerManager(manager);
@@ -526,6 +601,7 @@ test("deleteJob can remove a crawl while it is still running", serial, async () 
   const manager = new CrawlerManager(db);
   registerManager(manager);
   const job = await manager.startJob("https://example.com", 1);
+  const artifactPath = join(jobsPath, `${job.id}.data`);
 
   const queuedDeadline = Date.now() + 2000;
   while (Date.now() < queuedDeadline) {
@@ -559,6 +635,7 @@ test("deleteJob can remove a crawl while it is still running", serial, async () 
   assert.equal(frontierRows?.count, 0);
   assert.equal(jobPageRows?.count, 0);
   assert.equal(pageRows?.count, 0);
+  assert.equal(existsSync(artifactPath), false);
 });
 
 test("resume after interruption continues pending frontier", serial, async () => {
